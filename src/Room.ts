@@ -21,12 +21,13 @@ import {
     ReliablePacket,
     RemoveGameMessage,
     RemovePlayerMessage,
+    SceneChangeMessage,
     StartGameMessage,
     UnreliablePacket,
     WaitForHostMessage
 } from "@skeldjs/protocol";
 
-import { Code2Int, Int2Code } from "@skeldjs/util";
+import { Code2Int, Int2Code, sleep } from "@skeldjs/util";
 
 import { Hostable, PlayerData } from "@skeldjs/core";
 
@@ -34,6 +35,13 @@ import { Client } from "./Client";
 import { WorkerNode } from "./WorkerNode";
 import { Anticheat } from "./Anticheat";
 import { fmtName } from "./util/format-name";
+import chalk from "chalk";
+
+export enum SpecialId {
+    Nil = 0,
+    SaaH = -1,
+    Everyone = -2
+}
 
 export class Room extends Hostable {
     logger: winston.Logger;
@@ -49,8 +57,8 @@ export class Room extends Hostable {
 
     anticheat: Anticheat;
 
-    constructor(private server: WorkerNode) {
-        super({ doFixedUpdate: false });
+    constructor(private server: WorkerNode, public readonly SaaH: boolean) {
+        super({ doFixedUpdate: true });
 
         this.uuid = uuid.v4();
 
@@ -97,6 +105,14 @@ export class Room extends Hostable {
                 fmtName(setcolor.player), Color[setcolor.color]
             );
         });
+
+        if (SaaH) {
+            this.setHost(SpecialId.SaaH);
+        }
+    }
+
+    get amhost() {
+        return this.hostid === SpecialId.SaaH;
     }
 
     get name() {
@@ -123,7 +139,7 @@ export class Room extends Hostable {
     }
 
     async broadcast(
-        messages: BaseGameDataMessage[],
+        messages: BaseGameDataMessage[]|((client: Client) => BaseGameDataMessage[])|null,
         reliable: boolean = true,
         recipient: PlayerData | null = null,
         payloads: BaseRootMessage[] = []
@@ -136,7 +152,7 @@ export class Room extends Hostable {
                     ...(messages?.length ? [new GameDataToMessage(
                         this.code,
                         remote.clientid,
-                        messages
+                        typeof messages === "function" ? messages(remote) : messages
                     )] : []),
                     ...payloads
                 ];
@@ -151,26 +167,26 @@ export class Room extends Hostable {
                 );
             }
         } else {
-            const children = [
-                ...(messages?.length ? [new GameDataMessage(
-                    this.code,
-                    messages
-                )] : []),
-                ...payloads
-            ];
-
-            if (!children.length)
-                return;
-
             await Promise.all(
                 [...this.clients]
                     // .filter(([, client]) => !exclude.includes(client))
                     .map(([, client]) => {
+                        const children = [
+                            ...(messages?.length ? [new GameDataMessage(
+                                this.code,
+                                typeof messages === "function" ? messages(client) : messages
+                            )] : []),
+                            ...payloads
+                        ];
+
+                        if (!children.length)
+                            return Promise.resolve();
+                        
                         return client.send(
                             reliable
                                 ? new ReliablePacket(client.getNextNonce(), children)
                                 : new UnreliablePacket(children)
-                        )
+                        ).then(()=>{});
                     })
             );
         }
@@ -195,24 +211,59 @@ export class Room extends Hostable {
         ]);
     }
 
-    async updateHost(client: Client) {
-        await this.broadcast([], true, null, [
-            new JoinGameMessage(
-                this.code,
-                -1,
-                client.clientid
-            ),
-            new RemovePlayerMessage(
-                this.code,
-                -1,
-                DisconnectReason.None,
-                client.clientid
-            )
-        ]);
+    async updateHost(client: Client|number) {
+        const clientid = typeof client == "number"
+            ? client
+            : client.clientid;
+
+        if (clientid === SpecialId.Everyone) {
+            await Promise.all(
+                [...this.clients]
+                    // .filter(([, client]) => !exclude.includes(client))
+                    .map(([, client]) => {
+                        return client.send(
+                            new ReliablePacket(
+                                client.getNextNonce(),
+                                [
+                                    new JoinGameMessage(
+                                        this.code,
+                                        SpecialId.Nil,
+                                        client.clientid
+                                    ),
+                                    new RemovePlayerMessage(
+                                        this.code,
+                                        SpecialId.Nil,
+                                        DisconnectReason.None,
+                                        client.clientid
+                                    )
+                                ]
+                            )
+                        )
+                    })
+            );
+        } else {
+            await this.broadcast([], true, null, [
+                new JoinGameMessage(
+                    this.code,
+                    SpecialId.Nil,
+                    clientid
+                ),
+                new RemovePlayerMessage(
+                    this.code,
+                    SpecialId.Nil,
+                    DisconnectReason.None,
+                    clientid
+                )
+            ]);
+        }
     }
 
-    async setHost(player: PlayerData) {
-        const remote = this.clients.get(player.id);
+    async setHost(player: PlayerData|SpecialId.SaaH) {
+        const playerid = typeof player === "number"
+            ? player
+            : player.id;
+
+        const remote = this.clients.get(playerid);
 
         await super.setHost(player);
 
@@ -222,7 +273,7 @@ export class Room extends Hostable {
 
         this.logger.info(
             "Host changed to %s",
-            fmtName(player)
+            player === SpecialId.SaaH ? chalk.yellow("[Server]") : fmtName(player)
         );
     }
 
@@ -237,6 +288,12 @@ export class Room extends Hostable {
         }
 
         await this.setHost([...this.players.values()][0]);
+
+        if (this.SaaH) {
+
+        } else {
+
+        }
 
         await this.broadcast([], true, null, [
             new RemovePlayerMessage(
@@ -255,8 +312,8 @@ export class Room extends Hostable {
 
     async handleRemoteJoin(client: Client) {
         const player = await super.handleJoin(client.clientid);
-
-        if (!this.host)
+        
+        if (!this.host && !this.SaaH)
             await this.setHost(player);
 
         client.room = this;
@@ -309,6 +366,8 @@ export class Room extends Hostable {
             }
         }
 
+        if (this.SaaH) await this.updateHost(SpecialId.SaaH);
+
         await client.send(
             new ReliablePacket(
                 client.getNextNonce(),
@@ -316,7 +375,7 @@ export class Room extends Hostable {
                     new JoinedGameMessage(
                         this.code,
                         client.clientid,
-                        this.host.id,
+                        this.hostid,
                         [...this.clients]
                             .map(([, client]) => client.clientid)
                     )
@@ -328,11 +387,16 @@ export class Room extends Hostable {
             new JoinGameMessage(
                 this.code,
                 client.clientid,
-                this.host.id
+                this.hostid
             )
         ]);
         
         this.clients.set(client.clientid, client);
+
+        await this.wait("player.spawn");
+        await sleep(500);
+
+        if (this.SaaH) await this.updateHost(SpecialId.Everyone);
 
         this.logger.info(
             "Client with ID %s joined the game.",

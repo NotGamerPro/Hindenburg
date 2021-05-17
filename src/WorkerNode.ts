@@ -27,7 +27,7 @@ import {
 import { Code2Int } from "@skeldjs/util";
 import { SpawnPrefabs } from "@skeldjs/core";
 
-import { Room } from "./Room";
+import { Room, SpecialId } from "./Room";
 import { HindenburgConfig } from "./Node";
 import { MatchmakingNode } from "./MatchmakingNode";
 import { Client, ClientEvents } from "./Client";
@@ -84,7 +84,7 @@ export class WorkerNode extends MatchmakingNode<ClientEvents> {
             const name = String.fromCharCode(...chars);
             const code = Code2Int(name);
 
-            const room = new Room(this);
+            const room = new Room(this, true);
             room.settings.patch(message.options);
             room.setCode(code);
             this.rooms.set(code, room);
@@ -190,9 +190,10 @@ export class WorkerNode extends MatchmakingNode<ClientEvents> {
             if (
                 component.ownerid !== client.clientid
                 && !player.ishost
+                && !client.room.amhost
             ) {
                 client.room.logger.warn(
-                    "Player %s had data for or despawned %s but was not its owner.",
+                    "Player %s had data for or despawned object with netid %s but was not its owner.",
                     fmtName(player), message.netid
                 );
 
@@ -311,13 +312,19 @@ export class WorkerNode extends MatchmakingNode<ClientEvents> {
         this.decoder.on(GameDataToMessage, async (message, direction, client) => {
             if (!client.room)
                 return;
+                
+            if (message.recipientid === SpecialId.SaaH && !client.room.SaaH)
+                return;
 
             const player = client.room.players.get(client.clientid);
             const recipient = client.room.players.get(message.recipientid);
 
             const recipclient = client.room.clients.get(message.recipientid);
 
-            if (!recipient || !player || !recipclient)
+            if (message.recipientid !== SpecialId.SaaH && (!recipient || !recipclient))
+                return;
+
+            if (!player)
                 return;
 
             for (const gamedata of message._children) {
@@ -335,7 +342,7 @@ export class WorkerNode extends MatchmakingNode<ClientEvents> {
                             case RpcMessageTag.CastVote:
                             case RpcMessageTag.CloseDoorsOfType:
                             case RpcMessageTag.RepairSystem:
-                                if (!recipient.ishost) {
+                                if (message.recipientid !== SpecialId.SaaH && !recipient?.ishost) {
                                     client.room.logger.warn(
                                         "Player %s tried to send Rpc %s but the recipient wasn't the host.",
                                         fmtName(player), RpcMessageTag[rpc.data.tag]
@@ -368,32 +375,13 @@ export class WorkerNode extends MatchmakingNode<ClientEvents> {
                                 fmtName(player)
                             );
 
-                            if (recipient.spawned) {
+                            if (message.recipientid !== SpecialId.SaaH && recipient?.spawned) {
                                 client.room.logger.warn(
                                     "Player %s tried to send a spawn but the recipient had already spawned.",
                                     fmtName(player)
                                 );
 
                                 if (await client.penalize("hostChecks")) {
-                                    return message.cancel();
-                                }
-                            }
-                        }
-                        break;
-                    case GameDataMessageTag.SceneChange:
-                        if (!recipient.ishost) {
-                            client.room.logger.warn(
-                                "Player %s tried to change scene but the recipient wasn't the host.",
-                                fmtName(player)
-                            );
-
-                            if (player.spawned) {
-                                client.room.logger.warn(
-                                    "Player %s tried to change scene but they had already spawned.",
-                                    fmtName(player)
-                                );
-
-                                if (await client.penalize("invalidFlow")) {
                                     return message.cancel();
                                 }
                             }
@@ -410,18 +398,31 @@ export class WorkerNode extends MatchmakingNode<ClientEvents> {
                 }
             }
 
-            recipclient.send(
-                new ReliablePacket(
-                    recipclient.getNextNonce(),
-                    [
-                        new GameDataToMessage(
-                            client.room.code,
-                            recipclient.clientid,
-                            message._children
-                        )
-                    ]
-                )
-            );
+            if (recipclient) {
+                recipclient.send(
+                    new ReliablePacket(
+                        recipclient.getNextNonce(),
+                        [
+                            new GameDataToMessage(
+                                client.room.code,
+                                recipclient.clientid,
+                                message._children
+                            )
+                        ]
+                    )
+                );
+            } else {
+                console.log("f");
+                const children = message._children
+                    .filter(child => !child.canceled);
+    
+                if (!children.length)
+                    return;
+    
+                for (const child of children) {
+                    client.room.decoder.emitDecoded(child, direction, client);
+                }
+            }
         });
 
         this.on("client.disconnect", async disconnect => {

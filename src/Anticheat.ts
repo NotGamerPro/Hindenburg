@@ -43,7 +43,7 @@ export class Anticheat {
         this.decoder = new PacketDecoder;
 
         this.decoder.on(SetNameMessage, async (message, direction, { component, player, client }) => {
-            if (player.ishost) {
+            if (player.ishost || room.amhost) {
                 if (component.ownerid === player.id && message.name !== client.username) {
                     this.server.logger.warn(
                         "Client with ID %s set their name to %s while they identified as %s.",
